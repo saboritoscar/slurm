@@ -50,7 +50,7 @@ static void _config_defaults(void)
 	memset(&slingshot_config, 0, sizeof(slingshot_config_t));
 
 	slingshot_config.single_node_vni = false;
-	slingshot_config.user_vni = false;
+	slingshot_config.job_vni = false;
 
 	slingshot_config.limits.txqs.max = SLINGSHOT_TXQ_MAX;
 	slingshot_config.limits.tgqs.max = SLINGSHOT_TGQ_MAX;
@@ -125,7 +125,7 @@ static bool _setup_vni_table(uint16_t min, uint16_t max)
 	bitstr_t *table = slingshot_state.vni_table;
 
 	log_flag(SWITCH, "oldmin/max/size %hu %hu %zu min/max/size %hu %hu %zu",
-		oldmin, oldmax, oldsize, min, max, newsize);
+		 oldmin, oldmax, oldsize, min, max, newsize);
 
 	// If no recovery of vni_table, just set up new one
 	if (!slingshot_state.vni_table) {
@@ -300,8 +300,8 @@ static bool _config_limits(const char *token, slingshot_limits_set_t *limits)
 	if (!end_ptr || end_ptr == arg || *end_ptr != '\0')
 		goto err;
 	if (limit < 0 || limit > entry->max) {
-		error("Invalid limit token '%s': invalid limit %d"
-		      " (valid range 0-%d)", token, limit, entry->max);
+		error("Invalid limit token '%s': invalid limit %d (valid range 0-%d)",
+		      token, limit, entry->max);
 		goto out;
 	}
 	limit_ptr = (slingshot_limits_t *)(((void *) limits) + entry->offset);
@@ -313,12 +313,12 @@ static bool _config_limits(const char *token, slingshot_limits_set_t *limits)
 		limit_ptr->max = limit;
 	}
 	log_flag(SWITCH, "[token=%s]: limits[%d].%s.%s %d",
-		token, i, entry->name, typestr, limit);
+		 token, i, entry->name, typestr, limit);
 	xfree(tok);
 	return true;
 err:
 	error("Invalid limit token '%s' (example {max,res,def}_{%s})",
-		token, all_limits);
+	      token, all_limits);
 out:
 	xfree(tok);
 	return false;
@@ -355,7 +355,7 @@ extern bool slingshot_setup_config(const char *switch_params)
 	 *   vnis=<start>-<end> (e.g. vnis=1-16000)
 	 *   tcs=<tc_list> (e.g. tcs=BULK_DATA:BEST_EFFORT)
 	 *   single_node_vni: allocate VNI for single-node steps
-	 *   user_vni: allocate additional VNI per-user
+	 *   job_vni: allocate additional VNI per-job
 	 *   def_<NIC_resource>: default per-thread value for resource
 	 *   res_<NIC_resource>: reserved value for resource
 	 *   max_<NIC_resource>: maximum value for resource
@@ -395,8 +395,8 @@ extern bool slingshot_setup_config(const char *switch_params)
 				goto err;
 		} else if (!strcasecmp(token, "single_node_vni")) {
 			slingshot_config.single_node_vni = true;
-		} else if (!strcasecmp(token, "user_vni")) {
-			slingshot_config.user_vni = true;
+		} else if (!strcasecmp(token, "job_vni")) {
+			slingshot_config.job_vni = true;
 		} else {
 			if (!_config_limits(token, &slingshot_config.limits))
 				goto err;
@@ -404,8 +404,8 @@ extern bool slingshot_setup_config(const char *switch_params)
 	}
 
 out:
-	debug("single_node_vni=%d user_vni=%d tcs=%#x", \
-		slingshot_config.single_node_vni, slingshot_config.user_vni,
+	debug("single_node_vni=%d job_vni=%d tcs=%#x", \
+		slingshot_config.single_node_vni, slingshot_config.job_vni,
 		slingshot_config.tcs);
 	_print_limits(&slingshot_config.limits);
 
@@ -419,15 +419,15 @@ err:
 
 /*
  * Allocate a free VNI (range vni_min... vni_max, starting at vni_last + 1)
- * Return (positive integer) VNI on success, 0 on failure
+ * Return true with *vnip filled in on success, false on failure
  */
-static uint16_t _alloc_vni(void)
+static bool _alloc_vni(uint16_t *vnip)
 {
 	bitoff_t start, end, bit;
 	uint16_t vni;
 
 	// Search for clear bit from [vni_last + 1...vni_max]
-	start = slingshot_state.vni_last - slingshot_state.vni_min + 1;
+	start = (slingshot_state.vni_last + 1) - slingshot_state.vni_min;
 	end = slingshot_state.vni_max - slingshot_state.vni_min;
 	xassert(start >= 0);
 	log_flag(SWITCH, "upper bits: start/end %zu %zu", start, end);
@@ -436,17 +436,18 @@ static uint16_t _alloc_vni(void)
 			goto gotvni;
 	}
 	// Search for clear bit from [vni_min...vni_last]
+	start = 0;
 	end = slingshot_state.vni_last - slingshot_state.vni_min;
 	log_flag(SWITCH, "lower bits: start/end %zu %zu", start, end);
-	for (bit = 0; bit <= end; bit++) {
+	for (bit = start; bit <= end; bit++) {
 		if (!bit_test(slingshot_state.vni_table, bit))
 			goto gotvni;
 	}
 	// TODO: developer's mode: check for no bits set?
 	error("Cannot allocate VNI (min/max/last %hu %hu %hu)",
-		slingshot_state.vni_min, slingshot_state.vni_max,
-		slingshot_state.vni_last);
-	return 0;
+	      slingshot_state.vni_min, slingshot_state.vni_max,
+	      slingshot_state.vni_last);
+	return false;
 
 gotvni:
 	bit_set(slingshot_state.vni_table, bit);
@@ -454,46 +455,58 @@ gotvni:
 	vni = bit + slingshot_state.vni_min;
 	slingshot_state.vni_last = vni;
 	log_flag(SWITCH, "min/max/last %hu %hu %hu vni=%hu",
-		slingshot_state.vni_min, slingshot_state.vni_max,
-		slingshot_state.vni_last, vni);
-	return vni;
+		 slingshot_state.vni_min, slingshot_state.vni_max,
+		 slingshot_state.vni_last, vni);
+	*vnip = vni;
+	return true;
 }
 
 /*
- * Allocate a per-user VNI - if this is the first allocation for this user,
- * allocate a new VNI and add it to the user_vnis table;
- * otherwise return the VNI from the table for this user
- * Return 0 on error
+ * Allocate a per-job inter-job-step VNI.
+ * If this is the first allocation for this job ID,
+ * allocate a new VNI and add it to the job_vnis table;
+ * otherwise return the VNI from the table for this job ID
+ * Return true with *vnip filled in on success, false on failure
  */
-static uint16_t _alloc_user_vni(uint32_t uid)
+static bool _alloc_job_vni(uint32_t job_id, uint16_t *vnip)
 {
-	int i;
-	uint16_t vni;
+	int i, freeslot = -1;
+	job_vni_t *jobvni;
 
-	// Check if this uid is in the table already
-	for (i = 0; i < slingshot_state.num_user_vnis; i++) {
-		if (slingshot_state.user_vnis[i].uid == uid) {
-			vni = slingshot_state.user_vnis[i].vni;
+	// Check if this jobID is in the table already:
+	// if so, increment the reference count and return the VNI;
+	// otherwise, save the first free index into the table.
+	for (i = 0; i < slingshot_state.num_job_vnis; i++) {
+		jobvni = &slingshot_state.job_vnis[i];
+		if (jobvni->job_id == job_id) {
+			jobvni->refcnt++;
 			log_flag(SWITCH,
-				"[uid=%u]: found user_vnis[%d/%d] vni=%hu",
-				uid, i, slingshot_state.num_user_vnis, vni);
-			return vni;
+				 "[job_id=%u]: found job_vnis[%d/%d] refcnt=%hu vni=%hu",
+				 job_id, i, slingshot_state.num_job_vnis,
+				 jobvni->refcnt, jobvni->vni);
+			return jobvni->vni;
+		} else if (jobvni->job_id == 0 && jobvni->refcnt == 0) {
+			freeslot = i;
 		}
 	}
 
-	// Allocate new slot in user_vnis table
-	slingshot_state.num_user_vnis++;
-	xrecalloc(slingshot_state.user_vnis, slingshot_state.num_user_vnis,
-		  sizeof(user_vni_t));
+	// If no free slot, allocate a new slot in the job_vnis table
+	if (freeslot < 0) {
+		freeslot = slingshot_state.num_job_vnis;
+		slingshot_state.num_job_vnis++;
+		xrecalloc(slingshot_state.job_vnis,
+			slingshot_state.num_job_vnis, sizeof(job_vni_t));
+	}
 
-	if (!(vni = _alloc_vni()))
-		return 0;
+	if (!_alloc_vni(vnip))
+		return false;
 
-	i = slingshot_state.num_user_vnis - 1;
-	slingshot_state.user_vnis[i].uid = uid;
-	slingshot_state.user_vnis[i].vni = vni;
-	log_flag(SWITCH, "[uid=%u]: new vni[%d] vni=%hu", uid, i, vni);
-	return vni;
+	slingshot_state.job_vnis[freeslot].job_id = job_id;
+	slingshot_state.job_vnis[freeslot].vni = *vnip;
+	slingshot_state.job_vnis[freeslot].refcnt = 1;
+	log_flag(SWITCH, "[job_id=%u]: new vni[%d/%d] vni=%hu",
+		 job_id, freeslot, slingshot_state.num_job_vnis, *vnip);
+	return true;
 }
 
 /*
@@ -506,13 +519,45 @@ static void _free_vni(uint16_t vni)
 	if (lost_vnis && (vni < slingshot_state.vni_min ||
 				 vni > slingshot_state.vni_max)) {
 		info("vni %hu: not in current table min/max %hu-%hu",
-		     vni, slingshot_state.vni_min, slingshot_state.vni_max);
+			vni, slingshot_state.vni_min, slingshot_state.vni_max);
 		return;
 	}
 	bitoff_t bit = vni - slingshot_state.vni_min;
 	xassert(bit_test(slingshot_state.vni_table, bit));
 	bit_clear(slingshot_state.vni_table, bit);
 	log_flag(SWITCH, "[vni=%hu]: bit %zu", vni, bit);
+}
+
+/*
+ * Free an allocated per-job "user" VNI
+ */
+static void _free_job_vni(uint16_t vni)
+{
+	int i;
+	job_vni_t *jobvni = NULL;
+
+	// Find the jobID/vni in the job_vnis table;
+	// decrement the reference count, and zero-out the slot
+	// in the table if the refcnt is zero
+	for (i = 0; i < slingshot_state.num_job_vnis; i++) {
+		jobvni = &slingshot_state.job_vnis[i];
+		if (jobvni->vni == vni) {
+			xassert(jobvni->refcnt > 0);
+			jobvni->refcnt--;
+			log_flag(SWITCH,
+				 "[job_id=%u]: free job_vnis[%d/%d] refcnt=%hu vni=%hu",
+				 jobvni->job_id, i,
+				 slingshot_state.num_job_vnis,
+				 jobvni->refcnt, jobvni->vni);
+			if (jobvni->refcnt == 0) {
+				_free_vni(jobvni->vni);
+				memset(jobvni, 0, sizeof(*jobvni));
+				return;
+			}
+		}
+	}
+	error("vni=%hu: not found in job_vnis[%d]",
+	      vni, slingshot_state.num_job_vnis);
 }
 
 /*
@@ -532,8 +577,7 @@ static uint32_t _setup_depth(const char *token)
 	log_flag(SWITCH, "[token=%s]: depth %u", token, ret);
 	return ret;
 err:
-	error("Invalid depth token '%s' (valid range %d-%d)",
-		token, 1, 1024);
+	error("Invalid depth token '%s' (valid range %d-%d)", token, 1, 1024);
 	return 0;
 }
 
@@ -591,29 +635,33 @@ err:
  * or --network parameters have syntax errors
  */
 extern bool slingshot_setup_job(slingshot_jobinfo_t *job,
-	int node_cnt, uint32_t uid, const char *network_params)
+	int node_cnt, uint32_t job_id, const char *network_params)
 {
+	int alloc_vnis = 0;
+
 	// VNIs and traffic classes are not allocated for single-node jobs,
 	// unless 'single_node_vni' is set in the configuration
 	job->num_vnis = 0;
 	if (node_cnt > 1 || slingshot_config.single_node_vni) {
-		job->num_vnis++;
+		alloc_vnis++;
 		job->tcs = slingshot_config.tcs;
 	}
 	// Add user VNI if configured
-	if (slingshot_config.user_vni)
-		job->num_vnis++;
+	if (slingshot_config.job_vni)
+		alloc_vnis++;
 
-	job->vnis = xcalloc(job->num_vnis, sizeof(uint16_t));
-	if (job->num_vnis >= 1) {
-		if (!(job->vnis[0] = _alloc_vni()))
+	job->vnis = xcalloc(alloc_vnis, sizeof(uint16_t));
+	if (alloc_vnis >= 1) {
+		if (!_alloc_vni(&job->vnis[0]))
 			goto err;
+		job->num_vnis++;
 	}
 
-	// Allocate per-user VNI if configured
-	if (job->num_vnis == 2) {
-		if (!(job->vnis[1] = _alloc_user_vni(uid)))
+	// Allocate per-job VNI if configured
+	if (alloc_vnis == 2) {
+		if (!_alloc_job_vni(job_id, &job->vnis[1]))
 			goto err;
+		job->num_vnis++;
 	}
 
 	job->limits = slingshot_config.limits;
@@ -631,10 +679,10 @@ extern bool slingshot_setup_job(slingshot_jobinfo_t *job,
 
 err:
 	if (job->vnis) {
-		for (int i = 0; i < job->num_vnis; i++) {
-			if (job->vnis[i])
-				_free_vni(job->vnis[i]);
-		}
+		if (job->num_vnis > 0)
+			_free_vni(job->vnis[0]);
+		if (job->num_vnis > 1)
+			_free_job_vni(job->vnis[1]);
 		xfree(job->vnis);
 	}
 
@@ -643,7 +691,11 @@ err:
 
 extern void slingshot_free_job(slingshot_jobinfo_t *job)
 {
-	// Only free first VNI (second is a user_vni)
-	if (job->num_vnis > 0 && job->vnis)
-		_free_vni(job->vnis[0]);
+	// Second VNI is a user VNI
+	if (job->vnis) {
+		if (job->num_vnis > 0)
+			_free_vni(job->vnis[0]);
+		if (job->num_vnis > 1)
+			_free_job_vni(job->vnis[1]);
+	}
 }

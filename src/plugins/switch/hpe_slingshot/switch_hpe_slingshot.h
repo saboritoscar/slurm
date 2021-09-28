@@ -58,7 +58,7 @@
 #define SLINGSHOT_CXI_LIB	"libcxi.so.0"
 
 // Min/max VNI values
-#define SLINGSHOT_VNI_MIN 1
+#define SLINGSHOT_VNI_MIN 0
 #define SLINGSHOT_VNI_MAX 65535
 #define SLINGSHOT_VNIS    4	// Max VNIs/service
 
@@ -66,11 +66,12 @@
 #define SLINGSHOT_VNI_MIN_DEF 32768
 #define SLINGSHOT_VNI_MAX_DEF 65535
 
-// Per-user shared VNI structure
-typedef struct user_vni {
-	uint32_t uid;		// User-ID
-	uint16_t vni;		// Per-User-ID shared VNI
-} user_vni_t;
+// Per-job shared VNI structure
+typedef struct job_vni {
+	uint32_t job_id;	// Job ID
+	uint16_t vni;		// Per-Job-ID shared VNI
+	uint16_t refcnt;	// Reference count for this job
+} job_vni_t;
 
 // Format for state file created by switch_p_libstate_save
 typedef struct slingshot_state {
@@ -79,8 +80,8 @@ typedef struct slingshot_state {
 	uint16_t vni_max;	// Maximum VNI to allocate
 	uint16_t vni_last;      // Last allocated VNI
 	bitstr_t *vni_table;    // Bitmap of allocated VNIs
-	uint32_t num_user_vnis;	// Number of per-user shared VNIs
-	user_vni_t *user_vnis;	// Per-user shared VNI reservations
+	uint32_t num_job_vnis;	// Number of per-job shared VNIs
+	job_vni_t *job_vnis;	// Per-job shared VNI reservations
 } slingshot_state_t;
 
 // Max NIC resources per application
@@ -126,7 +127,7 @@ typedef struct slingshot_limits_set {
 // based on defaults and 'SwitchParameters' slurm.conf variable
 typedef struct slingshot_config {
 	bool single_node_vni;		 // Allocate VNIs for single-node apps
-	bool user_vni;			 // Allocate extra VNI per-user
+	bool job_vni;			 // Allocate extra VNI per-job
 	uint32_t tcs;                    // Bitmap of default traffic classes
 	slingshot_limits_set_t limits;   // Set of NIC resource limits
 } slingshot_config_t;
@@ -135,13 +136,15 @@ typedef struct slingshot_config {
 typedef struct pals_comm_profile {
 	uint32_t svc_id;        // SLINGSHOT service ID
 	uint16_t vnis[SLINGSHOT_VNIS]; // VNIs for this service
+	uint16_t vnis_used;     // number of valid VNIs in vnis[]
 	uint32_t tcs;           // Bitmap of allowed traffic classes
 	char device_name[16];   // NIC device name (e.g. "cxi0")
 } pals_comm_profile_t;
 
-//FIXME: plugin should not have a separate version, should use SLURM_PROTOCOL_VERSION
 // Version of the jobinfo structure
-#define SLINGSHOT_JOBINFO_VERSION 1
+#define SLINGSHOT_JOBINFO_VERSION SLURM_PROTOCOL_VERSION
+// Denotes packing a null jobinfo structure
+#define SLINGSHOT_JOBINFO_NULL_VERSION 0xDEAFDEAF
 
 // Jobinfo structure passed from slurmctld to slurmd
 typedef struct slingshot_jobinfo {
@@ -175,7 +178,7 @@ extern slingshot_config_t slingshot_config;
 // config.c
 extern bool slingshot_setup_config(const char *switch_params);
 extern bool slingshot_setup_job(slingshot_jobinfo_t *job, int node_cnt,
-	uint32_t uid, const char *network_params);
+	uint32_t job_id, const char *network_params);
 extern void slingshot_free_job(slingshot_jobinfo_t *job);
 // setup_nic.c
 extern bool slingshot_open_cxi_lib(void);

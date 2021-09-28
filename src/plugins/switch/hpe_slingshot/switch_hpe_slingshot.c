@@ -105,6 +105,8 @@ int init(void)
 
 int fini(void)
 {
+	extern int switch_p_libstate_clear(void);
+
 	if (running_in_slurmctld())
 		switch_p_libstate_clear();
 	else
@@ -134,6 +136,7 @@ extern int switch_p_reconfig(void)
 int switch_p_libstate_save(char *dir_name)
 {
 	int state_fd;
+	uint32_t actual_job_vnis;
 	buf_t *state_buf;
 	char *new_state_file, *state_file, *buf;
 	size_t buflen;
@@ -149,10 +152,27 @@ int switch_p_libstate_save(char *dir_name)
 	pack16(slingshot_state.vni_max, state_buf);
 	pack16(slingshot_state.vni_last, state_buf);
 	pack_bit_str_hex(slingshot_state.vni_table, state_buf);
-	pack32(slingshot_state.num_user_vnis, state_buf);
-	for (int i = 0; i < slingshot_state.num_user_vnis; i++) {
-		pack32(slingshot_state.user_vnis[i].uid, state_buf);
-		pack16(slingshot_state.user_vnis[i].vni, state_buf);
+
+	// Pack only job_vni slots that are being used
+	actual_job_vnis = 0;
+	for (int i = 0; i < slingshot_state.num_job_vnis; i++) {
+		if (slingshot_state.job_vnis[i].job_id)
+			actual_job_vnis++;
+	}
+	pack32(actual_job_vnis, state_buf);
+	debug("%s: packing %u/%u user VNIs",
+	       state_file, actual_job_vnis, slingshot_state.num_job_vnis);
+	if (actual_job_vnis > 0) {
+		for (int i = 0; i < slingshot_state.num_job_vnis; i++) {
+			if (slingshot_state.job_vnis[i].job_id) {
+				pack32(slingshot_state.job_vnis[i].job_id,
+				       state_buf);
+				pack16(slingshot_state.job_vnis[i].vni,
+				       state_buf);
+				pack16(slingshot_state.job_vnis[i].refcnt,
+				       state_buf);
+			}
+		}
 	}
 
 	// Get file names for the current and new state files
@@ -252,16 +272,20 @@ int switch_p_libstate_restore(char *dir_name, bool recover)
 	safe_unpack16(&slingshot_state.vni_max, state_buf);
 	safe_unpack16(&slingshot_state.vni_last, state_buf);
 	unpack_bit_str_hex(&slingshot_state.vni_table, state_buf);
-	safe_unpack32(&slingshot_state.num_user_vnis, state_buf);
-	slingshot_state.user_vnis = NULL;
-	if (slingshot_state.num_user_vnis > 0) {
-		slingshot_state.user_vnis = xcalloc(
-			slingshot_state.num_user_vnis, sizeof(user_vni_t));
-		for (i = 0; i < slingshot_state.num_user_vnis; i++) {
-			safe_unpack32(
-				&slingshot_state.user_vnis[i].uid, state_buf);
-			safe_unpack16(
-				&slingshot_state.user_vnis[i].vni, state_buf);
+	safe_unpack32(&slingshot_state.num_job_vnis, state_buf);
+	slingshot_state.job_vnis = NULL;
+	if (slingshot_state.num_job_vnis > 0) {
+		debug("%s: unpacking %u user VNIs",
+		      state_file, slingshot_state.num_job_vnis);
+		slingshot_state.job_vnis = xcalloc(
+			slingshot_state.num_job_vnis, sizeof(job_vni_t));
+		for (i = 0; i < slingshot_state.num_job_vnis; i++) {
+			safe_unpack32(&slingshot_state.job_vnis[i].job_id,
+				state_buf);
+			safe_unpack16(&slingshot_state.job_vnis[i].vni,
+				state_buf);
+			safe_unpack16(&slingshot_state.job_vnis[i].refcnt,
+				state_buf);
 		}
 	}
 
@@ -277,20 +301,20 @@ error:
 	xfree(state_file);
 	if (slingshot_state.vni_table)
 		bit_free(slingshot_state.vni_table);
-	xfree(slingshot_state.user_vnis);
+	xfree(slingshot_state.job_vnis);
 
 	return SLURM_ERROR;
 }
 
 int switch_p_libstate_clear(void)
 {
-	log_flag(SWITCH, "vni_table=%p user_vnis=%p num_user_vnis=%u",
-		slingshot_state.vni_table, slingshot_state.user_vnis,
-		slingshot_state.num_user_vnis);
+	log_flag(SWITCH, "vni_table=%p job_vnis=%p num_job_vnis=%u",
+		slingshot_state.vni_table, slingshot_state.job_vnis,
+		slingshot_state.num_job_vnis);
 
 	if (slingshot_state.vni_table)
 		bit_free(slingshot_state.vni_table);
-	xfree(slingshot_state.user_vnis);
+	xfree(slingshot_state.job_vnis);
 
 	return SLURM_SUCCESS;
 }
@@ -333,7 +357,7 @@ int switch_p_build_jobinfo(switch_jobinfo_t *switch_job,
 
 	// Do VNI allocation/traffic classes/network limits
 	if (!slingshot_setup_job(job, step_layout->node_cnt,
-				 step_ptr->job_ptr->user_id, step_ptr->network))
+				 step_ptr->step_id.job_id, step_ptr->network))
 		return SLURM_ERROR;
 	return SLURM_SUCCESS;
 }
@@ -431,8 +455,17 @@ int switch_p_pack_jobinfo(switch_jobinfo_t *switch_job, buf_t *buffer,
 	uint32_t pidx;
 	slingshot_jobinfo_t *jobinfo = (slingshot_jobinfo_t *)switch_job;
 
-	xassert(jobinfo);
 	xassert(buffer);
+
+	// Nothing to pack, pack special "null" version number
+	if (!jobinfo ||
+		(jobinfo->version == SLINGSHOT_JOBINFO_NULL_VERSION)) {
+		debug("Nothing to pack");
+		pack32(SLINGSHOT_JOBINFO_NULL_VERSION, buffer);
+		return SLURM_SUCCESS;
+	}
+
+	xassert(jobinfo->version == SLINGSHOT_JOBINFO_VERSION);
 	pack32(jobinfo->version, buffer);
 	pack16_array(jobinfo->vnis, jobinfo->num_vnis, buffer);
 	pack32(jobinfo->tcs, buffer);
@@ -457,11 +490,23 @@ int switch_p_unpack_jobinfo(switch_jobinfo_t **switch_job, buf_t *buffer,
 			    uint16_t protocol_version)
 {
 	uint32_t pidx = 0;
-	slingshot_jobinfo_t *jobinfo = xmalloc(sizeof(*jobinfo));
+	slingshot_jobinfo_t *jobinfo;
 
-	xassert(switch_job);
+	if (!switch_job) {
+		debug("switch_job was NULL");
+		return SLURM_SUCCESS;
+	}
+
 	xassert(buffer);
+
+	jobinfo = xmalloc(sizeof(*jobinfo));
+	*switch_job = (switch_jobinfo_t *)jobinfo;
+
 	safe_unpack32(&jobinfo->version, buffer);
+	if (jobinfo->version == SLINGSHOT_JOBINFO_NULL_VERSION) {
+		debug("Nothing to unpack");
+		return SLURM_SUCCESS;
+	}
 	if (jobinfo->version != SLINGSHOT_JOBINFO_VERSION) {
 		error("SLINGSHOT jobinfo version %"PRIu32" != %d",
 			jobinfo->version, SLINGSHOT_JOBINFO_VERSION);
@@ -489,13 +534,13 @@ int switch_p_unpack_jobinfo(switch_jobinfo_t **switch_job, buf_t *buffer,
 			goto unpack_error;
 	}
 
-	*switch_job = (switch_jobinfo_t *)jobinfo;
 	return SLURM_SUCCESS;
 
 unpack_error:
 	error("error unpacking jobinfo struct");
 error:
-	xfree(jobinfo);
+	switch_p_free_jobinfo(*switch_job);
+	*switch_job = NULL;
 	return SLURM_ERROR;
 }
 
@@ -623,10 +668,10 @@ int switch_p_job_attach(switch_jobinfo_t *jobinfo, char ***env,
 			pidx, svc_ids, vnis, devices, tcss);
 	}
 
-	env_array_overwrite(env, "SLINGSHOT_SVC_IDS", svc_ids);
-	env_array_overwrite(env, "SLINGSHOT_VNIS", vnis);
-	env_array_overwrite(env, "SLINGSHOT_DEVICES", devices);
-	env_array_overwrite(env, "SLINGSHOT_TCS", tcss);
+	env_array_overwrite(env, SLINGSHOT_SVC_IDS_ENV, svc_ids);
+	env_array_overwrite(env, SLINGSHOT_VNIS_ENV, vnis);
+	env_array_overwrite(env, SLINGSHOT_DEVICES_ENV, devices);
+	env_array_overwrite(env, SLINGSHOT_TCS_ENV, tcss);
 
 	xfree(svc_ids);
 	xfree(vnis);

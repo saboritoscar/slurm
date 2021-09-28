@@ -37,6 +37,7 @@
 #include "config.h"
 
 #include "src/common/slurm_xlator.h"
+#include "src/slurmd/slurmd/slurmd.h"
 #include "switch_hpe_slingshot.h"
 
 #include <dlfcn.h>
@@ -52,7 +53,8 @@ static int cxi_ndevs = 0;
 // Function pointers loaded from libcxi
 static int (*cxil_get_device_list_p)(struct cxil_device_list **);
 static int (*cxil_open_device_p)(uint32_t, struct cxil_dev **);
-static int (*cxil_alloc_svc_p)(struct cxil_dev *, struct cxi_svc_desc *);
+static int (*cxil_alloc_svc_p)(struct cxil_dev *, struct cxi_svc_desc *,
+	struct cxi_svc_fail_info *);
 static int (*cxil_destroy_svc_p)(struct cxil_dev *, unsigned int);
 
 
@@ -121,11 +123,10 @@ static bool _get_reserved_limits(int dev, slingshot_limits_set_t *limits)
 	for (svc = 0; svc < list->count; svc++) {
 #define PLIMIT(DEV, SVC, LIM) { \
 	limits->LIM.res += list->descs[SVC].limits.LIM.res; \
-	log_flag(SWITCH, "CXI dev/svc/system[%d][%d][%d]: limits.%s.res %hu" \
-		" (tot/max %hu %hu)", \
-		DEV, SVC, list->descs[SVC].is_system_svc, #LIM, \
-		list->descs[SVC].limits.LIM.res, limits->LIM.res, \
-		list->descs[SVC].limits.LIM.max); \
+	log_flag(SWITCH, "CXI dev/svc/system[%d][%d][%d]: limits.%s.res %hu (tot/max %hu %hu)", \
+		 DEV, SVC, list->descs[SVC].is_system_svc, #LIM, \
+		 list->descs[SVC].limits.LIM.res, limits->LIM.res, \
+		 list->descs[SVC].limits.LIM.max); \
 }
 		PLIMIT(dev, svc, ptes);
 		PLIMIT(dev, svc, txqs);
@@ -151,7 +152,7 @@ static bool _create_cxi_devs(void)
 
 	if ((rc = cxil_get_device_list_p(&list))) {
 		error("Could not get a list of the CXI devices: %d %d",
-			  rc, errno);
+		      rc, errno);
 		return false;
 	}
 
@@ -170,7 +171,7 @@ static bool _create_cxi_devs(void)
 		struct cxil_devinfo *info = &list->info[dev];
 		if ((rc = cxil_open_device_p(info->dev_id, &cxi_devs[dev]))) {
 			error("Could not open CXI device %d: %d %d",
-				dev, rc, errno);
+			      dev, rc, errno);
 			continue;
 		}
 		// Only done in debug mode
@@ -199,9 +200,9 @@ static struct cxi_limits set_desc_limits(const char *name,
 	// Reserved can't be higher than max
 	ret.res = MIN(ret.res, ret.max);
 	log_flag(SWITCH, "job %s.max/res/def/cpus %hu %hu %hu %d"
-		" CXI desc %s.max/res %hu %hu",
-		name, joblimits->max, joblimits->res, joblimits->def, ncpus,
-		name, ret.max, ret.res);
+		 " CXI desc %s.max/res %hu %hu",
+		 name, joblimits->max, joblimits->res, joblimits->def, ncpus,
+		 name, ret.max, ret.res);
 	return ret;
 }
 
@@ -216,10 +217,11 @@ static void _create_cxi_descriptor(struct cxi_svc_desc *desc,
 
 	memset(desc, 0, sizeof(*desc));
 
-#if CXI_SVC_MEMBER_UID
+#ifdef CXI_SVC_MEMBER_UID
 	desc->restricted_members = true;
 	desc->members[0].type = CXI_SVC_MEMBER_UID;
 	desc->members[0].svc_member.uid = uid;
+	desc->members[1].type = CXI_SVC_MEMBER_IGNORE;
 #else
 	desc->restricted_members = false;
 #endif
@@ -227,15 +229,18 @@ static void _create_cxi_descriptor(struct cxi_svc_desc *desc,
 	// Set up VNI
 	if (job->num_vnis > 0) {
 		desc->restricted_vnis = true;
+		desc->num_vld_vnis = job->num_vnis;
 		for (int v = 0; v < job->num_vnis; v++)
 			desc->vnis[v] = job->vnis[v];
-	} else
+	} else {
+		desc->num_vld_vnis = 0;
 		desc->restricted_vnis = false;
+	}
 
 
-	// Set up traffic classes
+	// Set up traffic classes; best effort if none given
+	desc->restricted_tcs = true;
 	if (job->tcs) {
-		desc->restricted_tcs = true;
 		if (job->tcs & SLINGSHOT_TC_DEDICATED_ACCESS)
 			desc->tcs[CXI_TC_DEDICATED_ACCESS] = true;
 		if (job->tcs & SLINGSHOT_TC_LOW_LATENCY)
@@ -245,7 +250,11 @@ static void _create_cxi_descriptor(struct cxi_svc_desc *desc,
 		if (job->tcs & SLINGSHOT_TC_BEST_EFFORT)
 			desc->tcs[CXI_TC_BEST_EFFORT] = true;
 	} else
-		desc->restricted_tcs = false;
+		desc->tcs[CXI_TC_BEST_EFFORT] = true;
+
+	// Set up other fields
+	desc->persistent = false;
+	desc->is_system_svc = false;
 
 	// Set up resource limits
 	desc->resource_limits = true;
@@ -292,7 +301,7 @@ extern bool slingshot_open_cxi_lib(void)
 
 	if (!libfile || libfile[0] == '\0') {
 		error("Bad library file specified by %s variable",
-			SLINGSHOT_CXI_LIB_ENV);
+		      SLINGSHOT_CXI_LIB_ENV);
 		goto out;
 	}
 
@@ -332,7 +341,7 @@ extern bool slingshot_destroy_services(slingshot_jobinfo_t *job)
 			continue;
 
 		debug("Destroying CXI SVC ID %d on NIC %s",
-		      svc_id, cxi_devs[prof]->info.device_name);
+			svc_id, cxi_devs[prof]->info.device_name);
 
 		if (cxil_destroy_svc_p(cxi_devs[prof], svc_id)) {
 			error("Failed to destroy CXI Service ID %d: %d",
@@ -348,6 +357,76 @@ extern bool slingshot_destroy_services(slingshot_jobinfo_t *job)
 }
 
 /*
+ * If cxil_alloc_svc failed, log information about the failure
+ */
+static void _alloc_fail_info(const struct cxil_dev *dev,
+	const struct cxi_svc_desc *desc,
+	const struct cxi_svc_fail_info *fail_info)
+{
+	error("Slingshot service allocation failed on %s",
+	      dev->info.device_name);
+
+	for (int rsrc = 0; rsrc < CXI_RSRC_TYPE_MAX; rsrc++) {
+		char *rsrc_str = NULL;
+		int rsrc_req = 0;
+
+		switch (rsrc) {
+		case CXI_RSRC_TYPE_PTE:
+			rsrc_str = "portal table entries";
+			rsrc_req = desc->limits.ptes.res;
+			break;
+		case CXI_RSRC_TYPE_TXQ:
+			rsrc_str = "transmit command queues";
+			rsrc_req = desc->limits.txqs.res;
+			break;
+		case CXI_RSRC_TYPE_TGQ:
+			rsrc_str = "target command queues";
+			rsrc_req = desc->limits.tgqs.res;
+			break;
+		case CXI_RSRC_TYPE_EQ:
+			rsrc_str = "event queues";
+			rsrc_req = desc->limits.eqs.res;
+			break;
+		case CXI_RSRC_TYPE_CT:
+			rsrc_str = "counters";
+			rsrc_req = desc->limits.cts.res;
+			break;
+		case CXI_RSRC_TYPE_LE:
+			rsrc_str = "list entries";
+			rsrc_req = desc->limits.les.res;
+			break;
+		case CXI_RSRC_TYPE_TLE:
+			rsrc_str = "trigger list entries";
+			rsrc_req = desc->limits.tles.res;
+			break;
+		case CXI_RSRC_TYPE_AC:
+			rsrc_str = "addressing contexts";
+			rsrc_req = desc->limits.acs.res;
+			break;
+		case CXI_RSRC_TYPE_MAX:
+		default:
+			rsrc_str = "invalid resource";
+			break;
+		}
+
+		if (rsrc_req > fail_info->rsrc_avail[rsrc])
+			error("Only %d %s available on %s (requested %d)",
+			      fail_info->rsrc_avail[rsrc], rsrc_str,
+			      dev->info.device_name, rsrc_req);
+	}
+
+	if (fail_info->no_le_pools)
+		error("No list entry pools available on %s",
+		      dev->info.device_name);
+	if (fail_info->no_tle_pools)
+		error("No trigger list entry pools available on %s",
+		      dev->info.device_name);
+	if (fail_info->no_cntr_pools)
+		error("No counter pools available on %s",
+		      dev->info.device_name);
+}
+
+/*
  * Set up CXI services for each of the CXI NICs on this host
  */
 extern bool slingshot_create_services(
@@ -356,6 +435,7 @@ extern bool slingshot_create_services(
 	int prof;
 	struct cxi_svc_desc desc;
 	struct cxil_dev *dev;
+	struct cxi_svc_fail_info failinfo;
 	pals_comm_profile_t *profile;
 
 	xassert(job);
@@ -367,7 +447,7 @@ extern bool slingshot_create_services(
 	// Just return true if CXI not available or no VNIs to set up
 	if (!cxi_avail || !job->num_vnis) {
 		log_flag(SWITCH, "cxi_avail=%d num_vnis=%d, ret true",
-			cxi_avail, job->num_vnis);
+			 cxi_avail, job->num_vnis);
 		return true;
 	}
 
@@ -381,11 +461,9 @@ extern bool slingshot_create_services(
 		// Set what we'll need in the CXI Service
 		_create_cxi_descriptor(&desc, &dev->info, job, uid, step_cpus);
 
-		int svc_id = cxil_alloc_svc_p(dev, &desc);
+		int svc_id = cxil_alloc_svc_p(dev, &desc, &failinfo);
 		if (svc_id < 0) {
-			error("Could not create a CXI Service for"
-				" NIC %d (%s) (error %d)",
-				prof, dev->info.device_name, svc_id);
+			_alloc_fail_info(dev, &desc, &failinfo);
 			goto error;
 		}
 
