@@ -2184,6 +2184,7 @@ static batch_job_launch_msg_t *_build_launch_job_msg(job_record_t *job_ptr,
 		goto job_failed;
 	}
 
+	launch_msg_ptr->time_limit = job_ptr->time_limit;
 	launch_msg_ptr->ntasks = job_ptr->details->num_tasks;
 	launch_msg_ptr->alias_list = xstrdup(job_ptr->alias_list);
 	launch_msg_ptr->container = xstrdup(job_ptr->container);

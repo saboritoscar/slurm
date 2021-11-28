@@ -1182,6 +1182,7 @@ env_array_for_batch_job(char ***dest, const batch_job_launch_msg_t *batch,
 	                        slurm_conf.cluster_name);
 
 	env_array_overwrite_fmt(dest, "SLURM_JOB_ID", "%u", batch->job_id);
+	env_array_overwrite_fmt(dest, "SLURM_TIME_LIMIT", "%u", batch->time_limit);
 	env_array_overwrite_fmt(dest, "SLURM_JOB_NUM_NODES", "%u",
 				step_layout_req.num_hosts);
 	if (batch->array_task_id != NO_VAL) {
